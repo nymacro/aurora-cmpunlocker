@@ -85,10 +85,10 @@ if [[ ! -f "${INITRAMFS}" ]]; then
 fi
 
 log "Rebuilding initramfs for ${KVER}"
-# /root is a symlink to /var/roothome on bootc images.  /var is a tmpfs during
-# this build step, so create the target to avoid dracut's harmless
-# "installing '/root'" diagnostic.
-mkdir -p /var/roothome
+# /var is an empty tmpfs in this build step.  Create the directories dracut
+# needs: /var/tmp is its default tmpdir (a missing one is fatal), /var/log is
+# used for its log, and /root is a symlink to /var/roothome on bootc images.
+mkdir -p /var/tmp /var/log /var/roothome
 DRACUT_REMOVE=()
 if rpm -q kmod-v4l2loopback >/dev/null 2>&1; then
     mapfile -t DRACUT_REMOVE < <(rpm -ql kmod-v4l2loopback)
