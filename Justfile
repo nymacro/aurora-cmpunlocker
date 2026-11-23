@@ -1,5 +1,5 @@
 set dotenv-filename := "image-template.env"
-set dotenv-load := true
+set dotenv-load
 
 export image_name := env_var("IMAGE_NAME")
 export repo_organization := env_var("REPO_ORGANIZATION")
@@ -30,6 +30,7 @@ default:
 check:
     #!/usr/bin/env bash
     set -euo pipefail
+    echo "Using $(just --version)"
     find . -type f -name "*.just" -not -path "./.git/*" -exec just --unstable --fmt --check -f {} \;
     echo "Checking syntax: Justfile"
     just --unstable --fmt --check -f Justfile

@@ -197,7 +197,10 @@ stored in the image. If you rotate the key, re-enroll the new certificate.
 ## Build
 
 Requirements: `podman`/`buildah` (BuildKit-style `RUN --mount` support),
-network access, and enough disk for the Aurora and akmods images.
+network access, and enough disk for the Aurora and akmods images. CI pins
+`just` 1.59.0 for `just check` because `--fmt` output changes between releases;
+use the same version locally, or run `just fix` and accept the version-specific
+formatting.
 
 ```bash
 # Uses the pins in image-template.env; override with e.g. BASE_TAG=... just build.

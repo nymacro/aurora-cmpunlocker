@@ -73,6 +73,10 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          # Pin the formatter: `just --fmt` output changes between releases and
+          # `just check` compares the file byte-for-byte.
+          just-version: '1.59.0'
 
       - name: Install build tools
         run: |
