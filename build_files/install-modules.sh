@@ -6,6 +6,10 @@
 set -euo pipefail
 export LC_ALL=C
 
+# Make unattended CI failures diagnosable from the build log.
+# shellcheck disable=SC2154
+trap 'rc=$?; printf "\nERROR: install-modules.sh failed at line %s (exit %s): %s\n" "${LINENO}" "${rc}" "${BASH_COMMAND}" >&2' ERR
+
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }

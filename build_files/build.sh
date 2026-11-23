@@ -11,6 +11,11 @@
 set -euo pipefail
 export LC_ALL=C
 
+# The GitHub Actions log is usually the only record of an unattended failure,
+# so print the failing command before exiting.
+# shellcheck disable=SC2154
+trap 'rc=$?; printf "\nERROR: build.sh failed at line %s (exit %s): %s\n" "${LINENO}" "${rc}" "${BASH_COMMAND}" >&2' ERR
+
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -49,6 +54,8 @@ MODOUT="${OUT_DIR}/modules"
 KVER="$(rpm -q --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-core | sort -V | tail -n1)"
 [[ -n "${KVER}" && -d "/usr/lib/modules/${KVER}" ]] || die "Cannot determine the image kernel (kernel-core RPM)."
 log "Image kernel: ${KVER}"
+log "Build environment: $(nproc 2>/dev/null || echo '?') CPU(s)"
+df -h / /tmp 2>/dev/null || true
 
 if command -v dnf5 >/dev/null 2>&1; then
     DNF=dnf5
@@ -63,6 +70,7 @@ else
     "${DNF}" install -y --setopt=install_weak_deps=False \
         gcc make git tar xz curl patch kmod bc \
         python3 python3-pyyaml \
+        bison flex findutils perl-interpreter \
         elfutils-libelf-devel openssl openssl-devel \
         pciutils
 
@@ -71,8 +79,13 @@ else
     # kernel than the one shipped in the Aurora base.
     mapfile -t KDEVEL_RPMS < <(find /tmp/kernel-rpms -maxdepth 1 -type f -name 'kernel-devel-*.rpm' 2>/dev/null | sort -V)
     if (( ${#KDEVEL_RPMS[@]} > 0 )); then
-        log "Installing kernel-devel from akmods: ${KDEVEL_RPMS[*]}"
-        "${DNF}" install -y --setopt=install_weak_deps=False "${KDEVEL_RPMS[@]}"
+        # The RPMs shipped in the pinned Universal Blue akmods image are
+        # unsigned.  dnf does not check local packages by default, but
+        # --nogpgcheck keeps this working if localpkg_gpgcheck is enabled.
+        # Do not disable GPG for the general dependency install above; all hard
+        # dependencies of kernel-devel are installed there.
+        log "Installing unsigned kernel RPMs from akmods: ${KDEVEL_RPMS[*]}"
+        "${DNF}" install -y --setopt=install_weak_deps=False --nogpgcheck "${KDEVEL_RPMS[@]}"
     else
         KDEVEL_VER="${KVER%.*}"
         warn "No kernel-devel RPM bind-mounted; trying the Fedora repositories for ${KDEVEL_VER}"
@@ -157,6 +170,7 @@ fi
 # target kernel explicit and makes those host operations no-ops.  The real
 # initramfs is rebuilt later in the final image stage.
 FAKEBIN="/tmp/cmp-fakebin"
+CMP_BUILD_DIR="/tmp/cmp-build"
 REAL_UNAME="$(command -v uname)"
 rm -rf "${FAKEBIN}"
 mkdir -p "${FAKEBIN}"
@@ -187,7 +201,7 @@ log "Building patched NVIDIA ${NVIDIA_VERSION} modules (profile: ${CMPUNLOCKER_P
     CMPUNLOCKER_KVER="${KVER}" \
     CMPUNLOCKER_DRIVER_VERSION="${NVIDIA_VERSION}" \
     CMPUNLOCKER_CARD_PROFILE="${CMPUNLOCKER_PROFILE}" \
-    CMPUNLOCKER_BUILD_DIR=/tmp/cmp-build \
+    CMPUNLOCKER_BUILD_DIR="${CMP_BUILD_DIR}" \
         /bin/bash ./driver/build.sh
 )
 
@@ -376,5 +390,13 @@ passthrough=$(is_enabled "${ENABLE_PASSTHROUGH}" && echo true || echo false)
 iommu_kargs=$(is_enabled "${ENABLE_IOMMU_KARGS}" && echo true || echo false)
 signed=$( (( SIGNED == 1 )) && echo true || echo false )
 EOF
+
+# Everything needed by the final stage is in /out.  Remove the multi-GB
+# source/object tree so it is not committed in the builder stage layer (this
+# also keeps disk headroom for the final stage on hosted runners).
+log "Cleaning build trees and caches"
+rm -rf "${CMP_DIR}" "${CMP_BUILD_DIR}" "${FAKEBIN}" "${MODDEST}"
+"${DNF}" clean all >/dev/null 2>&1 || true
+df -h / 2>/dev/null || true
 
 log "Done. Staged ${NVIDIA_VERSION} modules for ${KVER} (signed=${SIGNED})"
