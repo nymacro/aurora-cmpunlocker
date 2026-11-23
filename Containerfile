@@ -8,12 +8,15 @@
 # kernel modules are rebuilt from the matching NVIDIA open-gpu-kernel-modules
 # release with cmpunlocker's CMP 170HX patches applied.
 #
-# The build is intentionally split in two stages:
+# The build follows the upstream image-template layout and is split into four
+# stages:
+#   * "ctx" exposes build_files/ and system_files/ to later stages without
+#     copying them into the final image.
 #   * "akmods" supplies the exact kernel-devel RPM for the kernel in the base
 #     image (Aurora builds its images against these pinned akmods layers).
 #   * "builder" installs those headers, downloads the matching NVIDIA source,
 #     applies cmpunlocker, builds/signs the modules and stages all runtime
-#     files.
+#     files (including system_files/).
 # The final stage only receives the staged files, installs the modules into
 # /usr/lib/modules/<kver>/updates/cmpunlocker, runs depmod and rebuilds the
 # initramfs.
@@ -26,6 +29,12 @@ ARG BASE_IMAGE="ghcr.io/ublue-os/aurora-nvidia-open"
 ARG BASE_TAG="stable-44.20260922.1"
 ARG AKMODS_IMAGE="ghcr.io/ublue-os/akmods-nvidia-open"
 ARG AKMODS_TAG="coreos-testing-44-7.1.10-200.fc44.x86_64"
+
+# Build context stage (image-template convention): build scripts and
+# system_files are bind-mounted, never copied into the final image.
+FROM scratch AS ctx
+COPY build_files /build_files
+COPY system_files /system_files
 
 # ---------------------------------------------------------------------------
 # Exact kernel-devel / kernel RPMs for the base image's kernel
@@ -49,9 +58,10 @@ ARG ENABLE_GEN2_SERVICE="1"
 ARG ENABLE_PASSTHROUGH="1"
 ARG ENABLE_IOMMU_KARGS="1"
 
-COPY build_files/ /tmp/build_files/
-
-RUN --mount=type=bind,from=akmods,source=/kernel-rpms,target=/tmp/kernel-rpms \
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    --mount=type=bind,from=akmods,source=/kernel-rpms,target=/tmp/kernel-rpms \
+    --mount=type=cache,dst=/var/cache \
+    --mount=type=cache,dst=/var/log \
     --mount=type=secret,id=mok_key \
     --mount=type=secret,id=mok_cert \
     BASE_IMAGE="${BASE_IMAGE}" \
@@ -65,7 +75,7 @@ RUN --mount=type=bind,from=akmods,source=/kernel-rpms,target=/tmp/kernel-rpms \
     ENABLE_GEN2_SERVICE="${ENABLE_GEN2_SERVICE}" \
     ENABLE_PASSTHROUGH="${ENABLE_PASSTHROUGH}" \
     ENABLE_IOMMU_KARGS="${ENABLE_IOMMU_KARGS}" \
-    /bin/bash /tmp/build_files/build-modules.sh
+    /bin/bash /ctx/build_files/build.sh
 
 # ---------------------------------------------------------------------------
 # Final bootc image
@@ -90,16 +100,16 @@ LABEL org.opencontainers.image.title="aurora-cmpunlocker" \
 
 COPY --from=builder /out/rootfs/ /
 COPY --from=builder /out/modules /tmp/cmpunlocker-modules
-COPY build_files/install-modules.sh /tmp/install-modules.sh
 
 # /boot and /var are mounted as tmpfs for dracut, matching Aurora's own
 # initramfs build.  /var is runtime-only and must stay empty in the image.
 RUN --network=none \
+    --mount=type=bind,from=ctx,source=/build_files,target=/ctx/build_files \
     --mount=type=tmpfs,dst=/boot \
     --mount=type=tmpfs,dst=/var \
     REBUILD_INITRAMFS="${REBUILD_INITRAMFS}" \
-    /bin/bash /tmp/install-modules.sh && \
-    rm -rf /tmp/install-modules.sh /tmp/cmpunlocker-modules
+    /bin/bash /ctx/build_files/install-modules.sh && \
+    rm -rf /tmp/cmpunlocker-modules
 
 # Keep this in the image build so regressions are caught before publishing.
 RUN --network=none bootc container lint --fatal-warnings --no-truncate

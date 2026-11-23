@@ -1,0 +1,10 @@
+# This file is optional, but if you want to index your image on
+# https://artifacthub.io/ sign up, add the Repository ID below, and verify
+# yourself as the publisher.  The image labels added by the Justfile build
+# recipe (io.artifacthub.package.*) provide the rest of the metadata.
+
+repositoryID: aurora-cmpunlocker
+
+owners: # (optional, used to claim repository ownership)
+  - name: Your Name
+    email: your_email@example.com

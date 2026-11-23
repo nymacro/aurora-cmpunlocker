@@ -1,0 +1,5 @@
+# Minimum filesystem size for the generated disk images.  Aurora's KDE
+# desktop plus the NVIDIA userspace needs more room than a bare bootc image.
+[[customizations.filesystem]]
+mountpoint = "/"
+minsize = "30 GiB"

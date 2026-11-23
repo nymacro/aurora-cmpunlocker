@@ -55,24 +55,54 @@ derives that tag from the base image's `ostree.linux` label in CI.
 
 ---
 
+## Repository layout
+
+This repository is laid out like the [Universal Blue image-template](https://github.com/ublue-os/image-template),
+so the usual template workflow applies:
+
+| Path | Purpose |
+|---|---|
+| `Containerfile` | Four-stage build: `ctx` (build assets), `akmods` (kernel headers), `builder` (patched modules), final bootc image. |
+| `build_files/build.sh` | Main builder. Clones cmpunlocker, validates the driver version, builds/signs the modules and stages `/out`. |
+| `build_files/install-modules.sh` | Final-stage install, `depmod`, `modinfo` guard, initramfs rebuild. |
+| `build_files/sign-modules.sh`, `generate-mok.sh`, `service.sh` | MOK signing, key generation, bootc-friendly service helper. |
+| `system_files/` | Files copied verbatim into the image; paths mirror the final filesystem (the image-template convention). |
+| `image-template.env` | Image name/organisation and the pinned build inputs. |
+| `Justfile` | `just build`, `check`, `lint`, `lint-image`, `verify`, `rechunk`, VM/disk recipes. |
+| `.github/workflows/build.yml` | Build, lint, optional rechunk, push and cosign-sign. |
+| `.github/workflows/build-disk.yml` | qcow2/ISO images via bootc-image-builder. |
+| `disk_config/` | Filesystem size and Anaconda ISO kickstart. |
+| `artifacthub-repo.yml` | Optional ArtifactHub repository metadata. |
+
+---
+
 ## Repository setup (one-time)
 
 1. Create a GitHub repository and push this tree. The workflow triggers on
    pushes to `main` **or** `master` and can also be started manually with
    `workflow_dispatch`.
-2. Enable **Settings → Actions → General → Allow all actions and reusable
+2. Edit `image-template.env`: set `IMAGE_NAME`, `REPO_ORGANIZATION` and, if you
+   build disk images, the image reference in `disk_config/iso.toml`. The pinned
+   `BASE_TAG`/`AKMODS_TAG`/`CMPUNLOCKER_REF` values should only change after
+   checking the compatibility matrix above.
+3. Enable **Settings → Actions → General → Allow all actions and reusable
    workflows** (or allow the actions used here).
-3. The workflow job already requests `packages: write` and `id-token: write`.
+4. The workflow job already requests `packages: write` and `id-token: write`.
    If the repository is in an organization, make sure org policy allows GitHub
    Actions to create and write packages, and that Actions can use the
-   `hastd/free-disk-space` and `sigstore/cosign-installer` actions.
-4. The first successful run publishes to
+   `ublue-os/remove-unwanted-software`, `extractions/setup-just` and
+   `sigstore/cosign-installer` actions.
+5. The first successful run publishes to
    `ghcr.io/<owner>/<repo>:stable`. Set the GHCR package visibility to public
    if you want unauthenticated `bootc switch`, or log in to GHCR on the target
    before switching.
-5. Optional but recommended: add `MOK_KEY`/`MOK_CERT` repository secrets if
-   Secure Boot will stay enabled (see below). Without them the image builds
-   with unsigned modules and Secure Boot must be disabled.
+6. Signing is optional for the container and required for Secure Boot:
+   - The image is cosign-signed keyless by default. To sign with a key instead,
+     add a `SIGNING_SECRET` repository secret containing an unprotected
+     `cosign.key` (as described by image-template).
+   - Add `MOK_KEY`/`MOK_CERT` repository secrets if Secure Boot will stay
+     enabled (see below). Without them the image builds with unsigned modules
+     and Secure Boot must be disabled.
 
 The workflow has no other required secrets; `GITHUB_TOKEN` is automatic.
 
@@ -170,10 +200,12 @@ Requirements: `podman`/`buildah` (BuildKit-style `RUN --mount` support),
 network access, and enough disk for the Aurora and akmods images.
 
 ```bash
+# Uses the pins in image-template.env; override with e.g. BASE_TAG=... just build.
 just build
-# or directly:
+
+# or directly (the Containerfile builds a `ctx` stage for build_files/system_files):
 podman build \
-  --pull=always \
+  --pull=newer \
   --platform linux/amd64 \
   --build-arg BASE_TAG=stable-44.20260922.1 \
   --build-arg AKMODS_TAG=coreos-testing-44-7.1.10-200.fc44.x86_64 \
@@ -183,9 +215,15 @@ podman build \
   -t localhost/aurora-cmpunlocker:stable .
 ```
 
-If you do not want signing, pass empty secret files (the `just build` recipe
-does this automatically). The Containerfile always mounts both MOK secrets, so
-a plain `podman build` needs explicit `--secret` flags.
+`just build [target_image] [tag]` tags the image (default
+`aurora-cmpunlocker:stable`, from `image-template.env`). It always mounts both
+MOK secrets; when `MOK_KEY`/`MOK_CERT` are unset it creates empty files and
+builds unsigned modules. A plain `podman build` needs explicit `--secret` flags
+(point them at empty files for an unsigned build).
+
+Handy recipes: `just check` (Justfile syntax), `just lint` (shellcheck),
+`just lint-image` (bootc container lint), `just verify` (module resolution and
+`build-info` from inside the image), and `just generate-mok`.
 
 Useful build args:
 
@@ -204,6 +242,9 @@ Useful build args:
 | `ENABLE_IOMMU_KARGS` | `1` | add `intel_iommu=on amd_iommu=on iommu=pt` via bootc kargs |
 | `REBUILD_INITRAMFS` | `1` | rebuild the image initramfs |
 
+The `just build` recipe exposes the four pinned inputs plus `SOURCE_URL` /
+`SOURCE_REVISION`; pass any other build arg with a direct `podman build`.
+
 Example: newer Fedora 45 testing base (same supported NVIDIA 615.71.09):
 
 ```bash
@@ -216,9 +257,26 @@ podman build \
 
 ### CI
 
-`.github/workflows/build.yml` builds `linux/amd64`, runs `bootc container lint`,
-pushes to GHCR on `main`/schedule/manual runs, and signs the image with cosign
-keyless signing. Pull requests build but do not push.
+`.github/workflows/build.yml` calls the same `Justfile` recipes used locally:
+`just check`, `just build`, `just lint-image`, an optional `just ostree-rechunk`
+(disable with the `rechunk` workflow input), tag generation, push to GHCR on the
+default branch/schedule/manual runs, and cosign signing of the digest (keyless,
+or with `SIGNING_SECRET` if set). Pull requests build but never push.
+
+### Disk images
+
+`disk_config/disk.toml` and `disk_config/iso.toml` feed
+`.github/workflows/build-disk.yml` (bootc-image-builder), producing qcow2 and
+Anaconda ISO artifacts, optionally uploaded to S3 via the `S3_*` secrets. Update
+the GHCR reference in `iso.toml` first. Locally, `just build-qcow2`,
+`just build-iso` and `just run-vm` work the same way as in image-template.
+
+### ArtifactHub
+
+The `io.artifacthub.package.*` labels written by the `Justfile` build recipe and
+`artifacthub-repo.yml` make the image indexable on
+[artifacthub.io](https://artifacthub.io). Fill in `repositoryID` and the owner
+details there once, then verify the repository on ArtifactHub. This is optional.
 
 ---
 
@@ -232,9 +290,10 @@ keyless signing. Pull requests build but do not push.
    `uname -r` pointing at the image kernel. The `mixed` profile keeps the 8 GB /
    10 GB geometry selection at runtime from the PCI device ID, so the image is
    not tied to a card that was present at build time.
-3. The builder also compiles `cmp_no_bus_reset.ko`, optionally signs all
-   modules, and stages runtime files under `/usr` (never `/usr/local`, which is
-   a symlink to `/var/usrlocal` on bootc systems).
+3. The builder (`build_files/build.sh`) also compiles `cmp_no_bus_reset.ko`,
+   optionally signs all modules, copies `system_files/` into the staged root,
+   and stages runtime files under `/usr` (never `/usr/local`, which is a symlink
+   to `/var/usrlocal` on bootc systems).
 4. **final stage**: copies the staged files, installs modules into
    `/usr/lib/modules/<kver>/updates/cmpunlocker/`, runs `depmod`, verifies with
    `modinfo -k <kver> -n` that `nvidia*` resolves to the patched tree, rebuilds

@@ -13,7 +13,8 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SERVICE_NAME="gen2.service"
 LOG_FILE="/var/log/gen2.log"
 
-# shellcheck source=../common/lib.sh
+# Provided by cmpunlocker at /usr/share/cmpunlocker/common/lib.sh at runtime.
+# shellcheck source=/dev/null
 source "${PROJECT_DIR}/common/lib.sh"
 
 usage() {

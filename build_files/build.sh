@@ -34,7 +34,10 @@ is_enabled() {
 : "${BASE_TAG:=unknown}"
 : "${AKMODS_TAG:=unknown}"
 
-RUNTIME_DIR="/tmp/build_files/runtime"
+# Build assets are bind-mounted from the Containerfile's `ctx` stage, matching
+# the upstream image-template layout.  Overridable for manual testing.
+BUILD_FILES="${BUILD_FILES:-/ctx/build_files}"
+SYSTEM_FILES="${SYSTEM_FILES:-/ctx/system_files}"
 CMP_DIR="/tmp/cmpunlocker"
 OUT_DIR="/out"
 ROOTFS="${OUT_DIR}/rootfs"
@@ -228,7 +231,7 @@ done
 SIGNED=0
 if [[ -s /run/secrets/mok_key && -s /run/secrets/mok_cert ]]; then
     log "Signing modules with the supplied MOK key"
-    /bin/bash /tmp/build_files/sign-modules.sh "${MODOUT}"
+    /bin/bash "${BUILD_FILES}/sign-modules.sh" "${MODOUT}"
     if [[ -f "${MODOUT}/mok.der" ]]; then
         SIGNED=1
         install -D -m 0644 "${MODOUT}/mok.der" \
@@ -264,6 +267,11 @@ KARGS_DIR="${ROOTFS}/usr/lib/bootc/kargs.d"
 install -d -m 0755 "${HELPER_DIR}" "${DOC_DIR}" "${SYSTEMD_DIR}" "${UDEV_DIR}" \
     "${MODPROBE_DIR}" "${KARGS_DIR}" "${ROOTFS}/usr/bin"
 
+# system_files/ mirrors the final image layout (the image-template convention).
+# Copy the whole tree, then drop the pieces disabled through build args.
+[[ -d "${SYSTEM_FILES}" ]] || die "system_files directory not found at ${SYSTEM_FILES}"
+cp -a "${SYSTEM_FILES}/." "${ROOTFS}/"
+
 install -m 0644 "${CMP_DIR}/README.md" "${DOC_DIR}/README.md"
 install -m 0644 "${CMP_DIR}/LICENSE" "${DOC_DIR}/LICENSE"
 install -m 0644 "${CMP_DIR}/CREDITS.md" "${DOC_DIR}/CREDITS.md"
@@ -274,12 +282,12 @@ install -m 0755 "${CMP_DIR}/verify.sh" "${DOC_DIR}/verify.sh"
 
 # Upstream tools expect to live in the cmpunlocker tree; keep that layout at
 # /usr/share/cmpunlocker and use small /usr/bin wrappers.
-install -m 0755 "${RUNTIME_DIR}/service.sh" "${DOC_DIR}/tools/service.sh"
+install -m 0755 "${BUILD_FILES}/service.sh" "${DOC_DIR}/tools/service.sh"
 install -m 0755 "${CMP_DIR}/tools/passthrough.sh" "${DOC_DIR}/tools/passthrough.sh"
 sed -i 's#^LIB="/usr/local/lib/cmpunlocker"#LIB="/usr/libexec/cmpunlocker"#' \
     "${DOC_DIR}/tools/passthrough.sh"
 grep -q '^LIB="/usr/libexec/cmpunlocker"' "${DOC_DIR}/tools/passthrough.sh" \
-    || die "Upstream passthrough.sh layout changed; update build-modules.sh LIB rewrite"
+    || die "Upstream passthrough.sh layout changed; update build.sh LIB rewrite"
 
 cat > "${ROOTFS}/usr/bin/cmpunlocker-verify" <<'EOF'
 #!/bin/sh
@@ -324,33 +332,29 @@ for name in sorted(regs):
 io.open(output_path, "w", encoding="utf-8", newline="\n").write("\n".join(lines) + "\n")
 PY
 
-    install -m 0644 "${RUNTIME_DIR}/cmpunlocker-passthrough.service" \
-        "${SYSTEMD_DIR}/cmpunlocker-passthrough.service"
-    install -m 0644 "${RUNTIME_DIR}/99-cmpunlocker-passthrough.rules" \
-        "${UDEV_DIR}/99-cmpunlocker-passthrough.rules"
-    install -m 0644 "${RUNTIME_DIR}/99-cmpunlocker-vfio.conf" \
-        "${MODPROBE_DIR}/zz-cmpunlocker-vfio.conf"
-
     install -d -m 0755 "${ROOTFS}/etc/systemd/system/multi-user.target.wants"
     ln -sfn /usr/lib/systemd/system/cmpunlocker-passthrough.service \
         "${ROOTFS}/etc/systemd/system/multi-user.target.wants/cmpunlocker-passthrough.service"
+else
+    rm -f "${SYSTEMD_DIR}/cmpunlocker-passthrough.service" \
+        "${UDEV_DIR}/99-cmpunlocker-passthrough.rules" \
+        "${MODPROBE_DIR}/zz-cmpunlocker-vfio.conf"
 fi
 
 if is_enabled "${ENABLE_GEN2_SERVICE}"; then
     log "Staging early-boot PCIe Gen2 retrain service"
     install -m 0755 "${CMP_DIR}/tools/hammer.sh" "${HELPER_DIR}/gen2-hammer"
-    install -m 0644 "${RUNTIME_DIR}/gen2.service" "${SYSTEMD_DIR}/gen2.service"
-    install -m 0644 "${RUNTIME_DIR}/99-cmpunlocker-gen2.conf" \
-        "${MODPROBE_DIR}/zz-cmpunlocker-gen2.conf"
 
     install -d -m 0755 "${ROOTFS}/etc/systemd/system/sysinit.target.wants"
     ln -sfn /usr/lib/systemd/system/gen2.service \
         "${ROOTFS}/etc/systemd/system/sysinit.target.wants/gen2.service"
+else
+    rm -f "${SYSTEMD_DIR}/gen2.service" \
+        "${MODPROBE_DIR}/zz-cmpunlocker-gen2.conf"
 fi
 
-if is_enabled "${ENABLE_IOMMU_KARGS}"; then
-    install -m 0644 "${RUNTIME_DIR}/60-cmpunlocker-iommu.toml" \
-        "${KARGS_DIR}/60-cmpunlocker-iommu.toml"
+if ! is_enabled "${ENABLE_IOMMU_KARGS}"; then
+    rm -f "${KARGS_DIR}/60-cmpunlocker-iommu.toml"
 fi
 
 ###############################################################################

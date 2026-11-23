@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices",
+  ],
+
+  "rebaseWhen": "never",
+
+  "packageRules": [
+    {
+      "automerge": true,
+      "matchUpdateTypes": ["pin", "pinDigest"]
+    },
+    // The base and akmods images are pinned to an exact, mutually compatible
+    // kernel/NVIDIA pair.  Renovate must not float those tags; update them in
+    // image-template.env after checking the README compatibility matrix.
+    {
+      "matchDatasources": ["docker"],
+      "matchPackageNames": [
+        "ghcr.io/ublue-os/aurora-nvidia-open",
+        "ghcr.io/ublue-os/akmods-nvidia-open",
+      ],
+      "pinDigests": false,
+      "enabled": false,
+    },
+    {
+      "enabled": false,
+      "matchUpdateTypes": ["digest", "pinDigest", "pin"],
+      "matchDepTypes": ["container"],
+      "matchFileNames": [".github/workflows/**.yaml", ".github/workflows/**.yml"],
+    },
+  ]
+}

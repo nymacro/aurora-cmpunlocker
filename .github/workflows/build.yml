@@ -1,4 +1,5 @@
-name: Build aurora-cmpunlocker
+---
+name: Build container image
 
 on:
   push:
@@ -7,10 +8,7 @@ on:
       - '**/*.md'
   pull_request:
   schedule:
-    # Weekly rebuild.  The Aurora base and cmpunlocker ref are pinned; this is a
-    # regression check and a chance to pick up a newer cmpunlocker ref when the
-    # workflow inputs are updated.
-    - cron: '0 5 * * 1'
+    - cron: '05 10 * * 1' # weekly regression rebuild
   workflow_dispatch:
     inputs:
       base_tag:
@@ -38,38 +36,48 @@ on:
         required: false
         default: true
         type: boolean
+      rechunk:
+        description: Rechunk the image before pushing (smaller delta updates)
+        required: false
+        default: true
+        type: boolean
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
+env:
+  IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}" # do not edit
+  IMAGE_NAME: ${{ github.event.repository.name }}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.base_tag }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build and publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 150
+  build_push:
+    name: Build and push image
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
     steps:
+      # These stage versions are pinned by https://github.com/renovatebot/renovate
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
-      - name: Free disk space
-        uses: hastd/free-disk-space@v0.1.2
-        with:
-          # The Aurora base is a large chunkah image; intermediate build layers
-          # need headroom on the hosted runner.
-          skip-if-available: "80"
+      - name: Maximize build space
+        uses: ublue-os/remove-unwanted-software@695eb75bc387dbcd9685a8e72d23439d8686cba6
 
-      - name: Install podman, skopeo, zstd, jq
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends podman skopeo zstd jq
+          sudo apt-get install -y --no-install-recommends skopeo jq
 
       - name: Resolve image and akmods tags
         id: resolve
@@ -111,16 +119,25 @@ jobs:
             exit 1
           fi
 
-          owner="$(tr '[:upper:]' '[:lower:]' <<<"${GITHUB_REPOSITORY_OWNER}")"
-          repo="$(tr '[:upper:]' '[:lower:]' <<<"${GITHUB_REPOSITORY#*/}")"
-          image="ghcr.io/${owner}/${repo}:${base_tag}"
           case "${base_tag}" in
             stable*)  stream_tag="stable" ;;
             testing*) stream_tag="testing" ;;
             latest*)  stream_tag="latest" ;;
             *)        stream_tag="${base_tag}" ;;
           esac
-          stream_image="ghcr.io/${owner}/${repo}:${stream_tag}"
+
+          # `just` reads these from the environment; they override the values in
+          # image-template.env for this run.
+          {
+            echo "BASE_TAG=${base_tag}"
+            echo "AKMODS_TAG=${akmods_tag}"
+            echo "CMPUNLOCKER_REF=${cmp_ref}"
+            echo "EXPECTED_NVIDIA_VERSION=${nvidia_version}"
+            echo "DEFAULT_TAG=${stream_tag}"
+            echo "REPO_ORGANIZATION=${GITHUB_REPOSITORY_OWNER}"
+            echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}"
+            echo "IMAGE_NAME=${IMAGE_NAME,,}"
+          } >> "${GITHUB_ENV}"
 
           {
             echo "base_tag=${base_tag}"
@@ -128,9 +145,7 @@ jobs:
             echo "cmpunlocker_ref=${cmp_ref}"
             echo "nvidia_version=${nvidia_version}"
             echo "kernel=${kernel}"
-            echo "image=${image}"
-            echo "stream_image=${stream_image}"
-            echo "publish=${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false') }}"
+            echo "default_tag=${stream_tag}"
           } >> "${GITHUB_OUTPUT}"
 
           echo "Base:     ${base_repo}:${base_tag}"
@@ -138,7 +153,9 @@ jobs:
           echo "Akmods:   ${akmods_repo}:${akmods_tag}"
           echo "cmp ref:  ${cmp_ref}"
           echo "NVIDIA:   ${nvidia_version} (expected)"
-          echo "Image:    ${image}"
+
+      - name: Check Just syntax
+        run: just check
 
       - name: Decode MOK signing secrets
         id: mok
@@ -152,89 +169,111 @@ jobs:
             printf '%s' "${MOK_KEY_B64}" | base64 -d > "${RUNNER_TEMP}/mok/mok.key"
             printf '%s' "${MOK_CERT_B64}" | base64 -d > "${RUNNER_TEMP}/mok/mok.crt"
             chmod 0600 "${RUNNER_TEMP}/mok/mok.key"
+            {
+              echo "MOK_KEY=${RUNNER_TEMP}/mok/mok.key"
+              echo "MOK_CERT=${RUNNER_TEMP}/mok/mok.crt"
+            } >> "${GITHUB_ENV}"
             echo "enabled=true" >> "${GITHUB_OUTPUT}"
           else
-            : > "${RUNNER_TEMP}/mok/mok.key"
-            : > "${RUNNER_TEMP}/mok/mok.crt"
             echo "enabled=false" >> "${GITHUB_OUTPUT}"
             echo "::warning::MOK_KEY/MOK_CERT are not set; modules will be unsigned. Disable Secure Boot or configure secrets."
           fi
 
-      - name: Check shell syntax
-        run: |
-          find build_files -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-
-      - name: Build image
-        env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
-          STREAM_IMAGE: ${{ steps.resolve.outputs.stream_image }}
-          BASE_TAG: ${{ steps.resolve.outputs.base_tag }}
-          AKMODS_TAG: ${{ steps.resolve.outputs.akmods_tag }}
-          CMPUNLOCKER_REF: ${{ steps.resolve.outputs.cmpunlocker_ref }}
-          EXPECTED_NVIDIA_VERSION: ${{ steps.resolve.outputs.nvidia_version }}
-          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
-          SOURCE_REVISION: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          podman build \
-            --pull=always \
-            --network=host \
-            --platform linux/amd64 \
-            --build-arg BASE_TAG="${BASE_TAG}" \
-            --build-arg AKMODS_TAG="${AKMODS_TAG}" \
-            --build-arg CMPUNLOCKER_REF="${CMPUNLOCKER_REF}" \
-            --build-arg EXPECTED_NVIDIA_VERSION="${EXPECTED_NVIDIA_VERSION}" \
-            --build-arg SOURCE_URL="${SOURCE_URL}" \
-            --build-arg SOURCE_REVISION="${SOURCE_REVISION}" \
-            --secret id=mok_key,src="${RUNNER_TEMP}/mok/mok.key" \
-            --secret id=mok_cert,src="${RUNNER_TEMP}/mok/mok.crt" \
-            --tag "${IMAGE}" \
-            --tag "${STREAM_IMAGE}" \
-            .
+      # This actually builds the container image.
+      - name: Build Image
+        id: build-image
+        run: just build "${IMAGE_NAME}" "${DEFAULT_TAG}"
 
       - name: Lint bootc image
-        env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
-        run: podman run --rm "${IMAGE}" bootc container lint --fatal-warnings --no-truncate
+        run: just lint-image "${IMAGE_NAME}" "${DEFAULT_TAG}"
 
-      - name: Log in to GHCR
-        if: steps.resolve.outputs.publish == 'true'
+      # Smaller delta updates; can be disabled from workflow_dispatch.
+      - name: Rechunk with rpm-ostree
+        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.rechunk) }}
+        id: rechunk
+        run: just ostree-rechunk "${IMAGE_NAME}" "${DEFAULT_TAG}"
+
+      - name: Generate Build Tags
+        id: gen-build-tags
         run: |
-          printf '%s' "${{ secrets.GITHUB_TOKEN }}" \
-            | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+          alias_tags="$(just generate-build-tags "${IMAGE_NAME}" "${DEFAULT_TAG}")"
+          echo "Tags for this Action..."
+          echo "${alias_tags}"
+          echo "alias_tags=${alias_tags}" >> "$GITHUB_OUTPUT"
 
-      - name: Install cosign
-        if: steps.resolve.outputs.publish == 'true'
-        uses: sigstore/cosign-installer@v3
-        with:
-          cosign-release: 'v2.5.0'
-
-      - name: Push and sign
-        if: steps.resolve.outputs.publish == 'true'
+      - name: Tag Image
+        id: tag-images
         env:
-          IMAGE: ${{ steps.resolve.outputs.image }}
-          STREAM_IMAGE: ${{ steps.resolve.outputs.stream_image }}
-          REGISTRY_USER: ${{ github.actor }}
-          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
+        run: |
+          just tag-images \
+            "${IMAGE_NAME}" \
+            "${DEFAULT_TAG}" \
+            "${ALIAS_TAGS}"
+
+      # Pull requests and non-default branches must never publish packages.
+      - name: Login to GitHub Container Registry
+        if: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push To GHCR
+        if: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        id: push-image
+        env:
+          ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
         run: |
           set -euo pipefail
-          sha_image="${IMAGE%:*}:sha-${GITHUB_SHA::7}"
-          podman tag "${IMAGE}" "${sha_image}"
-
-          for ref in "${IMAGE}" "${STREAM_IMAGE}" "${sha_image}"; do
-            podman push "${ref}"
-            cosign sign --yes \
-              --registry-username "${REGISTRY_USER}" \
-              --registry-password "${REGISTRY_TOKEN}" \
-              "${ref}"
+          for tag in ${ALIAS_TAGS}; do
+            podman push --digestfile=/tmp/digestfile "${IMAGE_NAME}:${tag}" "${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}"
           done
 
+          digest=$(< /tmp/digestfile)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        if: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: 'v3.1.4'
+
+      - name: Sign container image
+        id: sign-image
+        if: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        env:
+          COSIGN_EXPERIMENTAL: false
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
+          DIGEST: ${{ steps.push-image.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          # https://github.com/containers/container-libs/issues/388
+          # https://github.com/coreos/rpm-ostree/issues/5509
+          # Use the old bundle format so cosign 3.x works with bootc.
+          COSIGN_ARGS=(-y --new-bundle-format=false --use-signing-config=false)
+          if [[ -n "${COSIGN_PRIVATE_KEY}" ]]; then
+            cosign sign "${COSIGN_ARGS[@]}" --key env://COSIGN_PRIVATE_KEY \
+              "${IMAGE_REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          else
+            cosign sign "${COSIGN_ARGS[@]}" \
+              "${IMAGE_REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          fi
+
+      - name: Summary
+        if: ${{ github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+        env:
+          ALIAS_TAGS: ${{ steps.gen-build-tags.outputs.alias_tags }}
+        run: |
           {
             echo "### Published"
             echo
             echo '```'
-            echo "${STREAM_IMAGE}"
-            echo "${IMAGE}"
-            echo "${sha_image}"
+            for tag in ${ALIAS_TAGS}; do
+              echo "${IMAGE_REGISTRY}/${IMAGE_NAME}:${tag}"
+            done
+            echo "${IMAGE_REGISTRY}/${IMAGE_NAME}@${{ steps.push-image.outputs.digest }}"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
