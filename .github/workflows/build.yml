@@ -1,0 +1,240 @@
+name: Build aurora-cmpunlocker
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+  schedule:
+    # Weekly rebuild.  The Aurora base and cmpunlocker ref are pinned; this is a
+    # regression check and a chance to pick up a newer cmpunlocker ref when the
+    # workflow inputs are updated.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: Aurora nvidia-open base tag
+        required: false
+        default: stable-44.20260922.1
+        type: string
+      akmods_tag:
+        description: Matching akmods-nvidia-open tag (blank = derive from base)
+        required: false
+        default: ''
+        type: string
+      cmpunlocker_ref:
+        description: cmpunlocker git ref (tag, branch or commit)
+        required: false
+        default: v0.5
+        type: string
+      nvidia_version:
+        description: Expected NVIDIA driver version in the base (compatibility guard)
+        required: false
+        default: '615.71.09'
+        type: string
+      publish:
+        description: Push and sign the built image
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        uses: hastd/free-disk-space@v0.1.2
+        with:
+          # The Aurora base is a large chunkah image; intermediate build layers
+          # need headroom on the hosted runner.
+          skip-if-available: "80"
+
+      - name: Install podman, skopeo, zstd, jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman skopeo zstd jq
+
+      - name: Resolve image and akmods tags
+        id: resolve
+        env:
+          BASE_TAG_INPUT: ${{ github.event.inputs.base_tag }}
+          AKMODS_TAG_INPUT: ${{ github.event.inputs.akmods_tag }}
+          CMPUNLOCKER_REF_INPUT: ${{ github.event.inputs.cmpunlocker_ref }}
+          NVIDIA_VERSION_INPUT: ${{ github.event.inputs.nvidia_version }}
+        run: |
+          set -euo pipefail
+
+          base_tag="${BASE_TAG_INPUT:-stable-44.20260922.1}"
+          cmp_ref="${CMPUNLOCKER_REF_INPUT:-v0.5}"
+          nvidia_version="${NVIDIA_VERSION_INPUT:-615.71.09}"
+
+          base_repo="ghcr.io/ublue-os/aurora-nvidia-open"
+          akmods_repo="ghcr.io/ublue-os/akmods-nvidia-open"
+
+          base_labels="$(skopeo inspect --no-tags "docker://${base_repo}:${base_tag}")"
+          kernel="$(jq -r '.Labels["ostree.linux"] // empty' <<<"${base_labels}")"
+          if [[ -z "${kernel}" ]]; then
+            echo "::error::Could not read ostree.linux from ${base_repo}:${base_tag}"
+            exit 1
+          fi
+
+          akmods_tag="${AKMODS_TAG_INPUT:-}"
+          if [[ -z "${akmods_tag}" ]]; then
+            fedora="$(sed -E 's/.*\.fc([0-9]+)\..*/\1/' <<<"${kernel}")"
+            case "${base_tag}" in
+              stable|stable-*) akmods_flavor="coreos-testing" ;;
+              *)               akmods_flavor="main" ;;
+            esac
+            akmods_tag="${akmods_flavor}-${fedora}-${kernel}"
+          fi
+
+          if ! skopeo inspect --no-tags "docker://${akmods_repo}:${akmods_tag}" >/dev/null 2>&1; then
+            echo "::error::Missing matching akmods image ${akmods_repo}:${akmods_tag}"
+            echo "Set the akmods_tag workflow input explicitly."
+            exit 1
+          fi
+
+          owner="$(tr '[:upper:]' '[:lower:]' <<<"${GITHUB_REPOSITORY_OWNER}")"
+          repo="$(tr '[:upper:]' '[:lower:]' <<<"${GITHUB_REPOSITORY#*/}")"
+          image="ghcr.io/${owner}/${repo}:${base_tag}"
+          case "${base_tag}" in
+            stable*)  stream_tag="stable" ;;
+            testing*) stream_tag="testing" ;;
+            latest*)  stream_tag="latest" ;;
+            *)        stream_tag="${base_tag}" ;;
+          esac
+          stream_image="ghcr.io/${owner}/${repo}:${stream_tag}"
+
+          {
+            echo "base_tag=${base_tag}"
+            echo "akmods_tag=${akmods_tag}"
+            echo "cmpunlocker_ref=${cmp_ref}"
+            echo "nvidia_version=${nvidia_version}"
+            echo "kernel=${kernel}"
+            echo "image=${image}"
+            echo "stream_image=${stream_image}"
+            echo "publish=${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.event.inputs.publish != 'false') }}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Base:     ${base_repo}:${base_tag}"
+          echo "Kernel:   ${kernel}"
+          echo "Akmods:   ${akmods_repo}:${akmods_tag}"
+          echo "cmp ref:  ${cmp_ref}"
+          echo "NVIDIA:   ${nvidia_version} (expected)"
+          echo "Image:    ${image}"
+
+      - name: Decode MOK signing secrets
+        id: mok
+        env:
+          MOK_KEY_B64: ${{ secrets.MOK_KEY }}
+          MOK_CERT_B64: ${{ secrets.MOK_CERT }}
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "${RUNNER_TEMP}/mok"
+          if [[ -n "${MOK_KEY_B64}" && -n "${MOK_CERT_B64}" ]]; then
+            printf '%s' "${MOK_KEY_B64}" | base64 -d > "${RUNNER_TEMP}/mok/mok.key"
+            printf '%s' "${MOK_CERT_B64}" | base64 -d > "${RUNNER_TEMP}/mok/mok.crt"
+            chmod 0600 "${RUNNER_TEMP}/mok/mok.key"
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            : > "${RUNNER_TEMP}/mok/mok.key"
+            : > "${RUNNER_TEMP}/mok/mok.crt"
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::MOK_KEY/MOK_CERT are not set; modules will be unsigned. Disable Secure Boot or configure secrets."
+          fi
+
+      - name: Check shell syntax
+        run: |
+          find build_files -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
+
+      - name: Build image
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          STREAM_IMAGE: ${{ steps.resolve.outputs.stream_image }}
+          BASE_TAG: ${{ steps.resolve.outputs.base_tag }}
+          AKMODS_TAG: ${{ steps.resolve.outputs.akmods_tag }}
+          CMPUNLOCKER_REF: ${{ steps.resolve.outputs.cmpunlocker_ref }}
+          EXPECTED_NVIDIA_VERSION: ${{ steps.resolve.outputs.nvidia_version }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          podman build \
+            --pull=always \
+            --network=host \
+            --platform linux/amd64 \
+            --build-arg BASE_TAG="${BASE_TAG}" \
+            --build-arg AKMODS_TAG="${AKMODS_TAG}" \
+            --build-arg CMPUNLOCKER_REF="${CMPUNLOCKER_REF}" \
+            --build-arg EXPECTED_NVIDIA_VERSION="${EXPECTED_NVIDIA_VERSION}" \
+            --build-arg SOURCE_URL="${SOURCE_URL}" \
+            --build-arg SOURCE_REVISION="${SOURCE_REVISION}" \
+            --secret id=mok_key,src="${RUNNER_TEMP}/mok/mok.key" \
+            --secret id=mok_cert,src="${RUNNER_TEMP}/mok/mok.crt" \
+            --tag "${IMAGE}" \
+            --tag "${STREAM_IMAGE}" \
+            .
+
+      - name: Lint bootc image
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+        run: podman run --rm "${IMAGE}" bootc container lint --fatal-warnings --no-truncate
+
+      - name: Log in to GHCR
+        if: steps.resolve.outputs.publish == 'true'
+        run: |
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" \
+            | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Install cosign
+        if: steps.resolve.outputs.publish == 'true'
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.5.0'
+
+      - name: Push and sign
+        if: steps.resolve.outputs.publish == 'true'
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          STREAM_IMAGE: ${{ steps.resolve.outputs.stream_image }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha_image="${IMAGE%:*}:sha-${GITHUB_SHA::7}"
+          podman tag "${IMAGE}" "${sha_image}"
+
+          for ref in "${IMAGE}" "${STREAM_IMAGE}" "${sha_image}"; do
+            podman push "${ref}"
+            cosign sign --yes \
+              --registry-username "${REGISTRY_USER}" \
+              --registry-password "${REGISTRY_TOKEN}" \
+              "${ref}"
+          done
+
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "${STREAM_IMAGE}"
+            echo "${IMAGE}"
+            echo "${sha_image}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"

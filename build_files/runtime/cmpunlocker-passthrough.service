@@ -1,0 +1,14 @@
+[Unit]
+Description=cmpunlocker: arm CMP 170HX cards for VM passthrough
+Documentation=https://github.com/amoghmunikote/cmpunlocker
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+ConditionPathExists=/usr/libexec/cmpunlocker/passthrough-arm
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/cmpunlocker/passthrough-arm
+
+[Install]
+WantedBy=multi-user.target

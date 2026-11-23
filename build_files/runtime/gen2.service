@@ -1,0 +1,16 @@
+[Unit]
+Description=CMP 170HX early-boot PCIe Gen2 retrain
+Documentation=https://github.com/amoghmunikote/cmpunlocker
+DefaultDependencies=no
+After=sysinit.target
+Before=basic.target multi-user.target graphical.target
+ConditionPathExists=/usr/libexec/cmpunlocker/gen2-hammer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/cmpunlocker/gen2-hammer
+TimeoutStartSec=45
+RemainAfterExit=no
+
+[Install]
+WantedBy=sysinit.target

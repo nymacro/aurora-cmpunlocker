@@ -1,0 +1,5 @@
+# cmpunlocker: when a CMP 170HX is handed to vfio-pci, restore the GSP
+# boot-time registers so a guest using a stock NVIDIA driver can boot GSP.
+# The card is never reset, so the unlock survives the handoff.
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="vfio-pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x20c2", RUN+="/usr/libexec/cmpunlocker/gsp-restore %k"
+ACTION=="bind", SUBSYSTEM=="pci", DRIVER=="vfio-pci", ATTR{vendor}=="0x10de", ATTR{device}=="0x2082", RUN+="/usr/libexec/cmpunlocker/gsp-restore %k"

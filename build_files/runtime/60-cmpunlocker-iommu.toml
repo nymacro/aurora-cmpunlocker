@@ -1,0 +1,3 @@
+# cmpunlocker: enable IOMMU in passthrough mode for VFIO.  Both vendor
+# spellings are harmless when the other CPU vendor's option is present.
+kargs = ["intel_iommu=on", "amd_iommu=on", "iommu=pt"]
